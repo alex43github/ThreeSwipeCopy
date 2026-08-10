@@ -83,24 +83,6 @@ final class MultitouchMonitor {
     private var lastFireAt: TimeInterval = 0
     private var didLogFirstFrame = false
 
-    // MARK: 三指按住 + 第四指点按（删除到废纸篓）检测状态
-    private struct FourTapSession {
-        let baseIDs: Set<Int32>
-        let basePos: [Int32: (Float, Float)]
-        let beganAt: TimeInterval
-    }
-
-    private struct FingerEvent {
-        var joinAt: TimeInterval?
-        var liftAt: TimeInterval?
-    }
-
-    private let tapWindow: TimeInterval = 0.5         // 加入/离开配对的时间窗
-    private let maxFourTapSession: TimeInterval = 2.0 // 四指会话最长时长（防止悬挂）
-    private var prevFrameIDs: Set<Int32> = []
-    private var fourTapSession: FourTapSession?
-    private var fingerEvents: [Int32: FingerEvent] = [:]
-    private var lastFourTapFireAt: TimeInterval = 0
 
     // MARK: - 启动 / 停止
 
@@ -185,9 +167,21 @@ final class MultitouchMonitor {
     }
 
     private func process(touches: [Touch]) {
+        // 调试：触点集合（数量/手指/状态）变化时打印一行，用于排查四指手势
+        debugFrame(touches)
         // 四指手势与三指滑动独立检测、互不干扰
         handleFourFingerTap(touches: touches)
         handleThreeFingerSwipe(touches: touches)
+    }
+
+    /// 调试日志：仅当触点集合（数量 / 手指 id / 状态）变化时输出，避免刷屏
+    private var lastDebugSig = ""
+    private func debugFrame(_ touches: [Touch]) {
+        let sig = touches.map { "\($0.fingerId):\($0.state)" }.sorted().joined(separator: ",")
+        guard sig != lastDebugSig else { return }
+        lastDebugSig = sig
+        let pos = touches.prefix(4).map { String(format: "%.2f/%.2f", $0.x, $0.y) }.joined(separator: " ")
+        Log.write("[mt] debug count=\(touches.count) [\(sig)] pos=[\(pos)]")
     }
 
     // MARK: - 三指滑动
@@ -257,81 +251,178 @@ final class MultitouchMonitor {
 
     // MARK: - 三指按住 + 第四指点按
 
-    /// 检测「三指保持不动、第四根手指轻点一下」：
-    /// 同一根手指在一帧中加入、又在短时间内离开（或反之），且其余三指几乎静止 → 判定为轻点。
+    /// 四指手势状态机（不依赖 fingerId，只数触点数量 + 位置匹配）：
+    /// 3 根手指轻放（count=3，任意触点状态）→ 第 4 根手指短暂加入（count=4）
+    /// → 第 4 根手指离开（count=3），且 3 根基准手指位置几乎不变 → 判定为轻点，
+    /// 触发删除到废纸篓。
+    private struct BaseHold {
+        var positions: [(Float, Float)]   // 3 个基准触点位置（按 x 排序）
+        let beganAt: TimeInterval
+    }
+
+    private struct TapCandidate {
+        let joinedAt: TimeInterval
+        let basePositions: [(Float, Float)]  // 第四指加入瞬间冻结的基准位置快照
+    }
+
+    private let minHoldDuration: TimeInterval = 0.15 // 三指至少保持 count=3 这么久
+    private let tapWindow: TimeInterval = 0.8        // 第四指加入→离开的最长间隔（轻点）
+    private let driftThreshold: Float = 0.06         // 基准手指漂移上限：超过视为移动/换姿势
+    private let stationaryThreshold: Float = 0.045   // 触发时基准手指允许的位移
+    private let matchTolerance: Float = 0.07         // 位置匹配容差（识别“同一根手指”）
+    private var baseHold: BaseHold?
+    private var tapCandidate: TapCandidate?
+    private var prevFourCount = -1
+    private var lastFourTapFireAt: TimeInterval = 0
+
+    /// 触点归一化坐标，按 x 排序
+    private func positions(_ touches: [Touch]) -> [(Float, Float)] {
+        touches.map { ($0.x, $0.y) }.sorted { $0.0 < $1.0 }
+    }
+
+    /// a 中的每个点是否都能在 b 中找到（数量相同、一一匹配、误差 <= tolerance）
+    private func match(_ a: [(Float, Float)], _ b: [(Float, Float)], tolerance: Float) -> Bool {
+        guard a.count == b.count else { return false }
+        var used = [Bool](repeating: false, count: b.count)
+        for p in a {
+            var best: Float = .greatestFiniteMagnitude
+            var bestIdx = -1
+            for (j, q) in b.enumerated() where !used[j] {
+                let d = max(abs(p.0 - q.0), abs(p.1 - q.1))
+                if d < best { best = d; bestIdx = j }
+            }
+            if bestIdx < 0 || best > tolerance { return false }
+            used[bestIdx] = true
+        }
+        return true
+    }
+
+    /// a 中与 b 匹配后剩余（未匹配上）的点
+    private func unmatched(_ a: [(Float, Float)], _ b: [(Float, Float)], tolerance: Float) -> [(Float, Float)] {
+        var used = [Bool](repeating: false, count: b.count)
+        var rest: [(Float, Float)] = []
+        for p in a {
+            var best: Float = .greatestFiniteMagnitude
+            var bestIdx = -1
+            for (j, q) in b.enumerated() where !used[j] {
+                let d = max(abs(p.0 - q.0), abs(p.1 - q.1))
+                if d < best { best = d; bestIdx = j }
+            }
+            if bestIdx >= 0 && best <= tolerance {
+                used[bestIdx] = true
+            } else {
+                rest.append(p)
+            }
+        }
+        return rest
+    }
+
     private func handleFourFingerTap(touches: [Touch]) {
         let now = ProcessInfo.processInfo.systemUptime
-        let ids = Set(touches.map(\.fingerId))
-        let pos = Dictionary(uniqueKeysWithValues: touches.map { ($0.fingerId, ($0.x, $0.y)) })
+        let count = touches.count
+        let pos = positions(touches)
 
-        // 帧间 diff：记录每根手指加入/离开当前帧
-        let joined = ids.subtracting(prevFrameIDs)
-        let lifted = prevFrameIDs.subtracting(ids)
-        prevFrameIDs = ids
-
-        // 出现 4 指接触时建立（或重建）四指会话
-        if touches.count == 4 {
-            if fourTapSession == nil || fourTapSession!.baseIDs != ids {
-                fourTapSession = FourTapSession(baseIDs: ids, basePos: pos, beganAt: now)
-                fingerEvents = [:]
-            }
+        // 调试：触点数量变化日志（每次手势应能看到 3→4→3）
+        if count != prevFourCount {
+            let ids = Set(touches.map(\.fingerId))
+            Log.write("[mt] count \(prevFourCount)->\(count) ids=[\(ids.sorted())]")
+            prevFourCount = count
         }
 
-        guard let session = fourTapSession else {
-            fingerEvents = [:]
-            return
-        }
-
-        // 手指集合与基线不兼容（换手/重新摆放）→ 重置会话
-        guard ids.isSubset(of: session.baseIDs) || session.baseIDs.isSubset(of: ids) else {
-            fourTapSession = nil
-            fingerEvents = [:]
-            return
-        }
-
-        // 会话超时保护：四指悬停太久不判定
-        guard now - session.beganAt <= maxFourTapSession else {
-            fourTapSession = nil
-            fingerEvents = [:]
-            return
-        }
-
-        // 记录加入/离开时间
-        for id in joined {
-            if fingerEvents[id] == nil { fingerEvents[id] = FingerEvent(joinAt: nil, liftAt: nil) }
-            fingerEvents[id]?.joinAt = now
-        }
-        for id in lifted {
-            if fingerEvents[id] == nil { fingerEvents[id] = FingerEvent(joinAt: nil, liftAt: nil) }
-            fingerEvents[id]?.liftAt = now
-        }
-
-        // 触发判定：同一根手指「加入→离开」或「离开→加入」在时间窗内配对
-        for (id, ev) in fingerEvents {
-            guard let join = ev.joinAt, let lift = ev.liftAt else { continue }
-            guard abs(join - lift) <= tapWindow else { continue }
-            // 其余三指必须几乎静止（相对会话起点）
-            guard stationaryInFourTap(session, excluding: id, current: pos) else { continue }
-
-            if now - lastFourTapFireAt > cooldown {
-                lastFourTapFireAt = now
-                Log.write("[mt] 三指按住 + 第四指点按 已确认")
-                onFourFingerTap?()
-            }
-            fourTapSession = nil
-            fingerEvents = [:]
-            return
+        switch count {
+        case 3:
+            handleThreeHold(now: now, pos: pos)
+        case 4:
+            handleFourPresent(now: now, pos: pos)
+        default:
+            resetFourTapState(reason: "触点数量 \(count) 非 3/4")
         }
     }
 
-    /// 四指会话中，除事件指外其余手指相对会话起点是否几乎静止
-    private func stationaryInFourTap(_ session: FourTapSession, excluding: Int32, current: [Int32: (Float, Float)]) -> Bool {
-        for id in session.baseIDs where id != excluding {
-            guard let start = session.basePos[id], let p = current[id] else { return false }
-            if abs(p.0 - start.0) > minPerFingerMove || abs(p.1 - start.1) > minPerFingerMove {
-                return false
+    /// count == 3：维护三指按住基线，或完成一次第四指轻点
+    private func handleThreeHold(now: TimeInterval, pos: [(Float, Float)]) {
+        // 正处于第四指轻点候选：第四指已离开，回到三指 → 判定
+        if let cand = tapCandidate {
+            guard let base = baseHold else {
+                resetFourTapState(reason: "无基准")
+                return
             }
+            let tapDuration = now - cand.joinedAt
+            let holdDuration = now - base.beganAt
+            let still = match(cand.basePositions, pos, tolerance: stationaryThreshold)
+            Log.write("[mt] 第四指离开 tapDuration=\(String(format: "%.2f", tapDuration)) hold=\(String(format: "%.2f", holdDuration)) 静止=\(still)")
+            if tapDuration <= tapWindow && holdDuration >= minHoldDuration && still {
+                fireFourTap()
+            } else {
+                Log.write("[mt] 轻点未通过: tapDuration=\(String(format: "%.2f", tapDuration)) hold=\(String(format: "%.2f", holdDuration)) 静止=\(still)")
+            }
+            resetFourTapState(reason: "轻点判定完成")
+            return
         }
-        return true
+
+        // 无候选：维护三指基线（跟随慢速漂移）
+        if let b = baseHold {
+            if match(b.positions, pos, tolerance: driftThreshold) {
+                baseHold = BaseHold(positions: pos, beganAt: b.beganAt)
+                return
+            }
+            Log.write("[mt] 三指大幅移动，重置基线")
+            resetFourTapState(reason: "三指大幅移动")
+            return
+        }
+
+        // 首次进入三指：建立基线
+        baseHold = BaseHold(positions: pos, beganAt: now)
+        Log.write("[mt] 三指按住基线建立 pos=[\(fmt(pos))]")
+    }
+
+    /// count == 4：在三指基线之上检测到第四指加入
+    private func handleFourPresent(now: TimeInterval, pos: [(Float, Float)]) {
+        // 已有候选（第四指还没离开）：若按住太久则忽略本次
+        if let cand = tapCandidate {
+            if now - cand.joinedAt > tapWindow {
+                Log.write("[mt] 第四指按住超过 \(tapWindow)s，忽略本次")
+                tapCandidate = nil
+            }
+            return
+        }
+
+        guard let base = baseHold else {
+            // 没有三指基线直接出现四指（罕见）：忽略，等回落到三指
+            Log.write("[mt] 无三指基线直接四指，忽略")
+            return
+        }
+
+        let rest = unmatched(pos, base.positions, tolerance: matchTolerance)
+        if rest.count == 1 {
+            tapCandidate = TapCandidate(joinedAt: now, basePositions: base.positions)
+            Log.write("[mt] 第四指加入 新点=\(fmt(rest))")
+        } else {
+            Log.write("[mt] 四指帧与三指基线不匹配 剩余点=\(rest.count)")
+            resetFourTapState(reason: "四指集合与三指基线不兼容")
+        }
+    }
+
+    /// 触发删除（带冷却）
+    private func fireFourTap() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastFourTapFireAt > cooldown else { return }
+        lastFourTapFireAt = now
+        Log.write("[mt] 三指按住 + 第四指点按 已确认")
+        onFourFingerTap?()
+    }
+
+    /// 重置四指检测状态
+    private func resetFourTapState(reason: String) {
+        if baseHold != nil || tapCandidate != nil {
+            Log.write("[mt] 四指状态重置: \(reason)")
+        }
+        baseHold = nil
+        tapCandidate = nil
+    }
+
+    /// 调试：格式化触点坐标
+    private func fmt(_ pts: [(Float, Float)]) -> String {
+        pts.prefix(4).map { String(format: "%.2f/%.2f", $0.0, $0.1) }.joined(separator: " ")
     }
 }

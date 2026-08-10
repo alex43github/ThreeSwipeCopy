@@ -10,8 +10,10 @@ APP_DIR="$PWD/dist/ThreeSwipeCopy.app"
 DEST="/Applications/ThreeSwipeCopy.app"
 
 echo "==> 复制到 /Applications"
+pkill -x ThreeSwipeCopy 2>/dev/null || true
+sleep 1
 rm -rf "$DEST"
-ditto "$APP_DIR" "$DEST"
+ditto --noextattr "$APP_DIR" "$DEST"
 
 echo "==> 启动应用"
 open "$DEST"
