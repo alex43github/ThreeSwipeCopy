@@ -22,7 +22,15 @@ enum Gesture: String, CaseIterable {
     case swipeDown = "swipeDown"
     case swipeLeft = "swipeLeft"
     case swipeRight = "swipeRight"
-    case fourFingerTap = "fourFingerTap"
+    case fourFingerTap = "fourFingerTap"         // 三指按住 + 小指点按（删除）
+    case twoFingerTap = "twoFingerTap"
+    case twoFingerSwipeLeft = "twoFingerSwipeLeft"
+    case twoFingerSwipeRight = "twoFingerSwipeRight"
+    case fourFingerSwipeUp = "fourFingerSwipeUp"
+    case fourFingerSwipeDown = "fourFingerSwipeDown"
+    case fourFingerSwipeLeft = "fourFingerSwipeLeft"
+    case fourFingerSwipeRight = "fourFingerSwipeRight"
+    case fourFingerTapAll = "fourFingerTapAll"   // 四指同时轻点
 
     var title: String {
         switch self {
@@ -31,6 +39,14 @@ enum Gesture: String, CaseIterable {
         case .swipeLeft: return "三指左滑"
         case .swipeRight: return "三指右滑"
         case .fourFingerTap: return "三指按住+小指点按"
+        case .twoFingerTap: return "两指轻点"
+        case .twoFingerSwipeLeft: return "两指左滑"
+        case .twoFingerSwipeRight: return "两指右滑"
+        case .fourFingerSwipeUp: return "四指上滑"
+        case .fourFingerSwipeDown: return "四指下滑"
+        case .fourFingerSwipeLeft: return "四指左滑"
+        case .fourFingerSwipeRight: return "四指右滑"
+        case .fourFingerTapAll: return "四指轻点"
         }
     }
 
@@ -40,6 +56,25 @@ enum Gesture: String, CaseIterable {
         case .down: self = .swipeDown
         case .left: self = .swipeLeft
         case .right: self = .swipeRight
+        }
+    }
+
+    /// 四指滑动方向 → 手势
+    init(fourFinger direction: SwipeDirection) {
+        switch direction {
+        case .up: self = .fourFingerSwipeUp
+        case .down: self = .fourFingerSwipeDown
+        case .left: self = .fourFingerSwipeLeft
+        case .right: self = .fourFingerSwipeRight
+        }
+    }
+
+    /// 两指滑动方向 → 手势（当前仅识别左右快速甩动；纵向交给系统滚动）
+    init?(twoFinger direction: SwipeDirection) {
+        switch direction {
+        case .left: self = .twoFingerSwipeLeft
+        case .right: self = .twoFingerSwipeRight
+        case .up, .down: return nil
         }
     }
 }
@@ -298,6 +333,10 @@ final class GestureController {
         case .swipeLeft: return .none
         case .swipeRight: return .none
         case .fourFingerTap: return .deleteFile
+        case .twoFingerTap, .twoFingerSwipeLeft, .twoFingerSwipeRight,
+             .fourFingerSwipeUp, .fourFingerSwipeDown, .fourFingerSwipeLeft,
+             .fourFingerSwipeRight, .fourFingerTapAll:
+            return .none   // 默认不占用，避免与系统/滚动冲突，用户需要时再绑定
         }
     }
 

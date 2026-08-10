@@ -23,6 +23,18 @@ final class MultitouchMonitor {
     /// 三指按住 + 第四指点按（轻点）已确认
     var onFourFingerTap: (() -> Void)?
 
+    /// 两指轻点已确认
+    var onTwoFingerTap: (() -> Void)?
+
+    /// 两指横向滑动（快速甩动）已确认：左 / 右
+    var onTwoFingerSwipe: ((_ direction: SwipeDirection) -> Void)?
+
+    /// 四指滑动已确认：方向（上 / 下 / 左 / 右）
+    var onFourFingerSwipe: ((_ direction: SwipeDirection) -> Void)?
+
+    /// 四指同时轻点已确认
+    var onFourFingerTapAll: (() -> Void)?
+
     // MARK: - 私有 API 符号（惰性加载一次）
 
     private struct Symbols {
@@ -169,7 +181,11 @@ final class MultitouchMonitor {
     private func process(touches: [Touch]) {
         // 调试：触点集合（数量/手指/状态）变化时打印一行，用于排查四指手势
         debugFrame(touches)
-        // 四指手势与三指滑动独立检测、互不干扰
+        // 各手势独立检测、互不干扰；已有三指逻辑勿改
+        handleFourFingerSwipe(touches: touches)
+        handleFourFingerTapAll(touches: touches)
+        handleTwoFingerSwipe(touches: touches)
+        handleTwoFingerTap(touches: touches)
         handleFourFingerTap(touches: touches)
         handleThreeFingerSwipe(touches: touches)
     }
@@ -254,6 +270,333 @@ final class MultitouchMonitor {
         lastFireAt = now
         Log.write("[mt] 三指\(direction.logName) 已确认")
         onSwipe?(direction)
+    }
+
+    // MARK: - 四指滑动
+
+    /// 四指滑动会话（独立于三指会话：四指落地时三指会话会被清掉）
+    private var fourSwipeSession: [Int32: FingerTrack]?
+    private var lastFourSwipeFireAt: TimeInterval = 0
+    private let fourSwipeThreshold: Float = 0.09        // 归一化平均位移阈值
+    private let fourSwipeMinPerFingerMove: Float = 0.02 // 每指至少移动这么多
+    private let fourSwipeCooldown: TimeInterval = 0.6
+
+    /// 识别四指上/下/左/右滑动。系统默认把四指上/下滑用于「调度中心 / 显示桌面」、
+    /// 左右滑用于「在全屏 App 之间切换」，若用户想绑定四指滑动，需在
+    /// 系统设置 → 触控板 → 更多手势 里关闭对应的系统手势。
+    private func handleFourFingerSwipe(touches: [Touch]) {
+        guard touches.count == 4 else {
+            fourSwipeSession = nil
+            return
+        }
+
+        if fourSwipeSession == nil {
+            var s: [Int32: FingerTrack] = [:]
+            for t in touches { s[t.fingerId] = FingerTrack(startX: t.x, startY: t.y) }
+            fourSwipeSession = s
+            return
+        }
+
+        guard let s = fourSwipeSession else { return }
+        let currentIDs = Set(touches.map(\.fingerId))
+        guard currentIDs == Set(s.keys) else {
+            fourSwipeSession = nil
+            return
+        }
+
+        var totalDX: [Float] = []
+        var totalDY: [Float] = []
+        for t in touches {
+            guard let track = fourSwipeSession?[t.fingerId] else { return }
+            totalDX.append(t.x - track.startX)
+            totalDY.append(t.y - track.startY)
+        }
+        guard totalDX.count == 4, totalDY.count == 4 else { return }
+
+        let avgX = totalDX.reduce(0, +) / 4
+        let avgY = totalDY.reduce(0, +) / 4
+        let verticalDominant = abs(avgY) > abs(avgX)
+
+        if verticalDominant {
+            guard totalDY.allSatisfy({ abs($0) >= fourSwipeMinPerFingerMove }) else { return }
+            let signY = Set(totalDY.map { $0 > 0 })
+            guard signY.count == 1 else { return }
+            guard abs(avgY) >= fourSwipeThreshold else { return }
+            fireFourSwipe(avgY > 0 ? .up : .down)
+        } else {
+            guard totalDX.allSatisfy({ abs($0) >= fourSwipeMinPerFingerMove }) else { return }
+            let signX = Set(totalDX.map { $0 > 0 })
+            guard signX.count == 1 else { return }
+            guard abs(avgX) >= fourSwipeThreshold else { return }
+            fireFourSwipe(avgX > 0 ? .right : .left)
+        }
+        fourSwipeSession = nil
+    }
+
+    private func fireFourSwipe(_ direction: SwipeDirection) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastFourSwipeFireAt > fourSwipeCooldown else { return }
+        lastFourSwipeFireAt = now
+        Log.write("[mt] 四指\(direction.logName) 已确认")
+        onFourFingerSwipe?(direction)
+    }
+
+    // MARK: - 四指同时轻点
+
+    /// 四指轻点状态机：四指几乎同时落下 → 基本静止 → 全部抬起 → 判定轻点。
+    /// 若位移超过阈值则判为滑动并放弃轻点；若先出现抬起又落回则取消。
+    private struct FourTapAllState {
+        let beganAt: TimeInterval          // 4 指全部落下的时刻
+        let startPositions: [(Float, Float)]
+        var liftStarted = false
+        var liftStartedAt: TimeInterval?
+    }
+
+    private var fourTapAllState: FourTapAllState?
+    private var lastFourTapAllFireAt: TimeInterval = 0
+    private var lastDownBeganAt: TimeInterval?    // 本次落指（0→有触点）起点，用于判断“几乎同时落下”
+    private var prevFourTapAllCount = -1
+    private let fourTapAllWindow: TimeInterval = 0.6     // 落下→全部抬起的最长间隔
+    private let fourTapAllLiftWindow: TimeInterval = 0.25 // 开始抬起→全部抬起的最长间隔
+    private let fourTapAllLandWindow: TimeInterval = 0.15 // 4 指须在首指落下后这么短时间内到齐
+    private let fourTapAllDrift: Float = 0.045           // 允许的位移（超过视为滑动）
+    private let fourTapAllCooldown: TimeInterval = 0.6
+
+    private func handleFourFingerTapAll(touches: [Touch]) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let count = touches.count
+
+        // 跟踪本次落指起点（只有回到 0 触点才重置）
+        if count == 0 {
+            lastDownBeganAt = nil
+        } else if lastDownBeganAt == nil {
+            lastDownBeganAt = now
+        }
+
+        let pos = positions(touches)
+
+        if let st = fourTapAllState {
+            switch count {
+            case 4:
+                // 仍全按：位移过大→滑动；按住超时→取消；抬起后又落回→取消
+                if !match(st.startPositions, pos, tolerance: fourTapAllDrift) {
+                    Log.write("[mt] 四指轻点：位移过大，取消（按滑动处理）")
+                    fourTapAllState = nil
+                } else if now - st.beganAt > fourTapAllWindow {
+                    Log.write("[mt] 四指轻点：按住超时，取消")
+                    fourTapAllState = nil
+                } else if st.liftStarted {
+                    Log.write("[mt] 四指轻点：抬起后又落回，取消")
+                    fourTapAllState = nil
+                }
+            case 0:
+                fourTapAllState = nil
+                let total = now - st.beganAt
+                // 四根手指可能同一帧同时抬起（没有经过 1~3 指的中间帧），也算有效轻点
+                let liftValid = st.liftStartedAt.map { now - $0 <= fourTapAllLiftWindow } ?? true
+                if total <= fourTapAllWindow && liftValid {
+                    fireFourTapAll()
+                } else {
+                    Log.write("[mt] 四指轻点未通过: total=\(String(format: "%.2f", total))")
+                }
+            default:
+                // 1~3：正在抬起
+                if !st.liftStarted {
+                    var s = st
+                    s.liftStarted = true
+                    s.liftStartedAt = now
+                    fourTapAllState = s
+                }
+            }
+            prevFourTapAllCount = count
+            return
+        }
+
+        // 无状态：触点数量增加到 4 且四指几乎同时落下 → 建立候选
+        // （避免把「三指按住+第四指点按」的删除手势误判成四指轻点）
+        let increased = count > prevFourTapAllCount
+        if count == 4 && increased,
+           let landed = lastDownBeganAt, now - landed <= fourTapAllLandWindow {
+            fourTapAllState = FourTapAllState(beganAt: now, startPositions: pos)
+            Log.write("[mt] 四指轻点候选建立（落地间隔 \(String(format: "%.3f", now - landed))s）")
+        }
+        prevFourTapAllCount = count
+    }
+
+    private func fireFourTapAll() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastFourTapAllFireAt > fourTapAllCooldown else { return }
+        lastFourTapAllFireAt = now
+        Log.write("[mt] 四指轻点 已确认")
+        onFourFingerTapAll?()
+    }
+
+    // MARK: - 两指轻点
+
+    /// 两指轻点状态机：两指落下 → 基本静止 → 全部抬起 → 判定轻点。
+    /// 注意：若系统把「两指点按」设为右键单击，会与本手势冲突，默认不绑定动作。
+    private struct TwoTapState {
+        let beganAt: TimeInterval
+        let startPositions: [(Float, Float)]
+        var liftStarted = false
+        var liftStartedAt: TimeInterval?
+    }
+
+    private var twoTapState: TwoTapState?
+    private var lastTwoTapFireAt: TimeInterval = 0
+    private var prevTwoTapCount = -1
+    private let twoTapWindow: TimeInterval = 0.5
+    private let twoTapLiftWindow: TimeInterval = 0.25
+    private let twoTapDrift: Float = 0.05
+    private let twoTapCooldown: TimeInterval = 0.6
+
+    private func handleTwoFingerTap(touches: [Touch]) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let count = touches.count
+        let pos = positions(touches)
+        let increased = count > prevTwoTapCount
+
+        if let st = twoTapState {
+            switch count {
+            case 2:
+                if !match(st.startPositions, pos, tolerance: twoTapDrift) {
+                    Log.write("[mt] 两指轻点：位移过大，取消（按滚动处理）")
+                    twoTapState = nil
+                } else if now - st.beganAt > twoTapWindow {
+                    Log.write("[mt] 两指轻点：按住超时，取消")
+                    twoTapState = nil
+                } else if st.liftStarted {
+                    Log.write("[mt] 两指轻点：抬起后又落回，取消")
+                    twoTapState = nil
+                }
+            case 0:
+                twoTapState = nil
+                let total = now - st.beganAt
+                // 两根手指可能同一帧同时抬起（没有经过 1 指的中间帧），也算有效轻点
+                let liftValid = st.liftStartedAt.map { now - $0 <= twoTapLiftWindow } ?? true
+                if total <= twoTapWindow && liftValid {
+                    fireTwoTap()
+                } else {
+                    Log.write("[mt] 两指轻点未通过: total=\(String(format: "%.2f", total))")
+                }
+            default:
+                if !st.liftStarted {
+                    var s = st
+                    s.liftStarted = true
+                    s.liftStartedAt = now
+                    twoTapState = s
+                }
+            }
+            prevTwoTapCount = count
+            return
+        }
+
+        // 无状态：触点增加到 2（0→2 或 1→2 均为新落指；3→2 是抬手不算）
+        if count == 2 && increased {
+            twoTapState = TwoTapState(beganAt: now, startPositions: pos)
+            Log.write("[mt] 两指轻点候选建立 pos=[\(fmt(pos))]")
+        }
+        prevTwoTapCount = count
+    }
+
+    private func fireTwoTap() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastTwoTapFireAt > twoTapCooldown else { return }
+        lastTwoTapFireAt = now
+        Log.write("[mt] 两指轻点 已确认")
+        onTwoFingerTap?()
+    }
+
+    // MARK: - 两指横向滑动（快速甩动）
+
+    /// 两指左右滑动（甩动）会话。与系统两指滚动天然冲突，
+    /// 因此只识别「落下后 0.4s 内横向甩过阈值」的快速动作，降低误触。
+    private struct TwoSwipeSession {
+        var tracks: [Int32: FingerTrack] = [:]
+        let beganAt: TimeInterval
+    }
+
+    private var twoSwipeSession: TwoSwipeSession?
+    private var lastTwoSwipeFireAt: TimeInterval = 0
+    private var prevTwoSwipeCount = -1
+    private let twoSwipeThreshold: Float = 0.10
+    private let twoSwipeMinPerFingerMove: Float = 0.02
+    private let twoSwipeFlickWindow: TimeInterval = 0.4
+    private let twoSwipeCooldown: TimeInterval = 0.6
+
+    private func handleTwoFingerSwipe(touches: [Touch]) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let count = touches.count
+
+        guard count == 2 else {
+            twoSwipeSession = nil
+            prevTwoSwipeCount = count
+            return
+        }
+
+        if twoSwipeSession == nil {
+            // 只在“落指”时建立会话（0→2 / 1→2），抬手（3→2）不算
+            let increased = count > prevTwoSwipeCount
+            guard increased else {
+                prevTwoSwipeCount = count
+                return
+            }
+            var s: [Int32: FingerTrack] = [:]
+            for t in touches { s[t.fingerId] = FingerTrack(startX: t.x, startY: t.y) }
+            twoSwipeSession = TwoSwipeSession(tracks: s, beganAt: now)
+            prevTwoSwipeCount = count
+            return
+        }
+
+        guard let s = twoSwipeSession else { return }
+        let currentIDs = Set(touches.map(\.fingerId))
+        guard currentIDs == Set(s.tracks.keys) else {
+            twoSwipeSession = nil
+            prevTwoSwipeCount = count
+            return
+        }
+
+        var totalDX: [Float] = []
+        var totalDY: [Float] = []
+        for t in touches {
+            guard let track = s.tracks[t.fingerId] else { return }
+            totalDX.append(t.x - track.startX)
+            totalDY.append(t.y - track.startY)
+        }
+        guard totalDX.count == 2, totalDY.count == 2 else { return }
+
+        let avgX = totalDX.reduce(0, +) / 2
+        let avgY = totalDY.reduce(0, +) / 2
+
+        // 只识别横向甩动；纵向（滚动）不抢
+        guard abs(avgX) > abs(avgY) else {
+            prevTwoSwipeCount = count
+            return
+        }
+        guard totalDX.allSatisfy({ abs($0) >= twoSwipeMinPerFingerMove }) else {
+            prevTwoSwipeCount = count
+            return
+        }
+        let signX = Set(totalDX.map { $0 > 0 })
+        guard signX.count == 1 else {
+            prevTwoSwipeCount = count
+            return
+        }
+        guard abs(avgX) >= twoSwipeThreshold, now - s.beganAt <= twoSwipeFlickWindow else {
+            prevTwoSwipeCount = count
+            return
+        }
+        fireTwoSwipe(avgX > 0 ? .right : .left)
+        twoSwipeSession = nil
+        prevTwoSwipeCount = count
+    }
+
+    private func fireTwoSwipe(_ direction: SwipeDirection) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastTwoSwipeFireAt > twoSwipeCooldown else { return }
+        lastTwoSwipeFireAt = now
+        Log.write("[mt] 两指\(direction.logName)（甩动）已确认")
+        onTwoFingerSwipe?(direction)
     }
 
     // MARK: - 三指按住 + 第四指点按

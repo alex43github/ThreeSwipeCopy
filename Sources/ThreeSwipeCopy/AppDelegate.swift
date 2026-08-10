@@ -222,6 +222,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         MultitouchMonitor.shared.onFourFingerTap = { [weak self] in
             self?.controller.handle(.fourFingerTap)
         }
+        MultitouchMonitor.shared.onTwoFingerTap = { [weak self] in
+            self?.controller.handle(.twoFingerTap)
+        }
+        MultitouchMonitor.shared.onTwoFingerSwipe = { [weak self] direction in
+            if let gesture = Gesture(twoFinger: direction) {
+                self?.controller.handle(gesture)
+            }
+        }
+        MultitouchMonitor.shared.onFourFingerSwipe = { [weak self] direction in
+            self?.controller.handle(Gesture(fourFinger: direction))
+        }
+        MultitouchMonitor.shared.onFourFingerTapAll = { [weak self] in
+            self?.controller.handle(.fourFingerTapAll)
+        }
         MultitouchMonitor.shared.start()
         mtStarted = true
         refreshPermissionItem()
