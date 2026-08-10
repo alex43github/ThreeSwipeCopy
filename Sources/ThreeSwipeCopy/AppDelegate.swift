@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import ServiceManagement
+import UniformTypeIdentifiers
 
 /// 菜单栏应用入口：状态栏图标 + 三指手势监听（MultitouchSupport）+ 可自定义手势动作 + 开机自启动开关。
 @main
@@ -116,10 +117,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         for gesture in Gesture.allCases {
             guard let item = gestureItems[gesture] else { continue }
-            let current = controller.action(for: gesture)
-            item.title = "\(gesture.title)：\(current.title)"
+            item.title = "\(gesture.title)：\(actionTitle(for: gesture))"
             item.submenu = buildActionSubmenu(for: gesture)
         }
+    }
+
+    /// 手势动作的显示标题：自定义 App 时显示真实 App 名
+    private func actionTitle(for gesture: Gesture) -> String {
+        let action = controller.action(for: gesture)
+        if action == .openCustomApp {
+            if let name = controller.customAppName(for: gesture) {
+                return "打开 \(name)"
+            }
+            return "自定义 App（未设置）"
+        }
+        return action.title
     }
 
     /// 构建某个手势的动作选择子菜单（BTT 风格分组）
@@ -152,6 +164,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addSection("打开 App", [.openFinder, .openSafari, .openChrome, .openTerminal,
                                 .openNotes, .openMail, .openMessages, .openMusic,
                                 .openCalculator, .openSystemSettings])
+
+        // 自定义 App：显示当前绑定 + 选择其他 App + 清除
+        if let name = controller.customAppName(for: gesture) {
+            let item = NSMenuItem(title: "打开 \(name)", action: #selector(selectAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ActionItemPayload(gesture: gesture, action: .openCustomApp)
+            item.state = (current == .openCustomApp) ? .on : .off
+            menu.addItem(item)
+        } else {
+            let item = NSMenuItem(title: "自定义 App（未设置）", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        let chooseItem = NSMenuItem(title: "选择其他 App…", action: #selector(chooseCustomApp(_:)), keyEquivalent: "")
+        chooseItem.target = self
+        chooseItem.representedObject = gesture
+        menu.addItem(chooseItem)
+        if controller.customAppPath(for: gesture) != nil {
+            let clearItem = NSMenuItem(title: "清除自定义 App", action: #selector(clearCustomApp(_:)), keyEquivalent: "")
+            clearItem.target = self
+            clearItem.representedObject = gesture
+            menu.addItem(clearItem)
+        }
+        menu.addItem(.separator())
         addSection("媒体与音量", [.mediaToggle, .mediaNext, .mediaPrev,
                                   .volumeUp, .volumeDown, .volumeMute])
         addSection("系统控制", [.missionControl, .launchpad, .showDesktop,
@@ -214,6 +250,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func resetActions() {
         controller.resetAll()
+        refreshStatusItems()
+    }
+
+    /// 「选择其他 App…」：弹出文件选择面板，把选中的 .app 绑定到该手势
+    @objc private func chooseCustomApp(_ sender: NSMenuItem) {
+        guard let gesture = sender.representedObject as? Gesture else { return }
+        let panel = NSOpenPanel()
+        panel.title = "为「\(gesture.title)」选择要打开的 App"
+        panel.message = "请选择一个 App（.app），例如 /Applications/微信.app"
+        panel.prompt = "选择"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.resolvesAliases = true
+        panel.allowedContentTypes = [.applicationBundle]
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        controller.setCustomApp(path: url.path, for: gesture)
+        refreshStatusItems()
+    }
+
+    /// 清除自定义 App（该手势恢复为无动作）
+    @objc private func clearCustomApp(_ sender: NSMenuItem) {
+        guard let gesture = sender.representedObject as? Gesture else { return }
+        controller.clearCustomApp(for: gesture)
         refreshStatusItems()
     }
 

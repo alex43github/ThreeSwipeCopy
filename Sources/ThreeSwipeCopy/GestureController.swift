@@ -79,6 +79,7 @@ enum Action: String, CaseIterable {
     case openMusic = "openMusic"
     case openCalculator = "openCalculator"
     case openSystemSettings = "openSystemSettings"
+    case openCustomApp = "openCustomApp"   // 用户自己选择的任意 App（路径存 customAppPaths）
 
     // MARK: 媒体与音量
     case mediaToggle = "mediaToggle"  // 播放/暂停
@@ -112,7 +113,8 @@ enum Action: String, CaseIterable {
              .switchApp, .fullscreen:
             return .shortcuts
         case .openFinder, .openSafari, .openChrome, .openTerminal, .openNotes,
-             .openMail, .openMessages, .openMusic, .openCalculator, .openSystemSettings:
+             .openMail, .openMessages, .openMusic, .openCalculator, .openSystemSettings,
+             .openCustomApp:
             return .apps
         case .mediaToggle, .mediaNext, .mediaPrev, .volumeUp, .volumeDown, .volumeMute:
             return .media
@@ -150,6 +152,7 @@ enum Action: String, CaseIterable {
         case .openMusic: return "打开音乐"
         case .openCalculator: return "打开计算器"
         case .openSystemSettings: return "打开系统设置"
+        case .openCustomApp: return "自定义 App…"
         case .mediaToggle: return "播放 / 暂停"
         case .mediaNext: return "下一首"
         case .mediaPrev: return "上一首"
@@ -189,6 +192,7 @@ final class GestureController {
     private enum Keys {
         static let enabled = "enabled"
         static let gestureActions = "gestureActions"
+        static let customAppPaths = "customAppPaths"
     }
 
     /// 是否启用（菜单可暂停）
@@ -224,6 +228,11 @@ final class GestureController {
 
     /// 设置手势绑定的动作（持久化到 UserDefaults）
     func setAction(_ action: Action, for gesture: Gesture) {
+        // 防止把未配置自定义 App 的手势绑定成 .openCustomApp（应通过 NSOpenPanel 选择）
+        if action == .openCustomApp && customAppPath(for: gesture) == nil {
+            Log.write("[cfg] 忽略：手势「\(gesture.title)」未选择自定义 App")
+            return
+        }
         actionMap[gesture] = action
         var stored = UserDefaults.standard.dictionary(forKey: Keys.gestureActions) as? [String: String] ?? [:]
         stored[gesture.rawValue] = action.rawValue
@@ -231,10 +240,54 @@ final class GestureController {
         Log.write("[cfg] 手势「\(gesture.title)」→ \(action.title)")
     }
 
+    // MARK: - 自定义 App（用户自己选择的任意 App）
+
+    /// 读取手势绑定的自定义 App 绝对路径；未设置返回 nil
+    func customAppPath(for gesture: Gesture) -> String? {
+        (UserDefaults.standard.dictionary(forKey: Keys.customAppPaths) as? [String: String])?[gesture.rawValue]
+    }
+
+    /// 读取自定义 App 的显示名（优先 Info.plist 的 CFBundleName，否则用文件名）
+    func customAppName(for gesture: Gesture) -> String? {
+        guard let path = customAppPath(for: gesture) else { return nil }
+        return Self.displayName(ofAppAt: path)
+    }
+
+    /// 绑定手势 → 打开指定路径的 App（同时把动作设为 .openCustomApp）
+    func setCustomApp(path: String, for gesture: Gesture) {
+        var stored = UserDefaults.standard.dictionary(forKey: Keys.customAppPaths) as? [String: String] ?? [:]
+        stored[gesture.rawValue] = path
+        UserDefaults.standard.set(stored, forKey: Keys.customAppPaths)
+        actionMap[gesture] = .openCustomApp
+        Log.write("[cfg] 手势「\(gesture.title)」→ 打开自定义 App：\(Self.displayName(ofAppAt: path)) (\(path))")
+    }
+
+    /// 清除手势绑定的自定义 App；若该手势当前绑定的正是打开自定义 App，则恢复为「无动作」
+    func clearCustomApp(for gesture: Gesture) {
+        var stored = UserDefaults.standard.dictionary(forKey: Keys.customAppPaths) as? [String: String] ?? [:]
+        stored.removeValue(forKey: gesture.rawValue)
+        UserDefaults.standard.set(stored, forKey: Keys.customAppPaths)
+        if actionMap[gesture] == .openCustomApp {
+            actionMap[gesture] = Action.none
+        }
+        Log.write("[cfg] 手势「\(gesture.title)」已清除自定义 App")
+    }
+
+    /// 根据 .app 绝对路径取显示名
+    static func displayName(ofAppAt path: String) -> String {
+        if let bundle = Bundle(path: path),
+           let name = bundle.object(forInfoDictionaryKey: "CFBundleName") as? String,
+           !name.isEmpty {
+            return name
+        }
+        return (path as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
+    }
+
     /// 恢复默认动作
     func resetAll() {
         actionMap = [:]
         UserDefaults.standard.removeObject(forKey: Keys.gestureActions)
+        UserDefaults.standard.removeObject(forKey: Keys.customAppPaths)
         Log.write("[cfg] 已恢复默认手势动作")
     }
 
@@ -254,15 +307,17 @@ final class GestureController {
         let now = CACurrentMediaTime()
         guard now - lastTriggerAt > cooldown else { return }
         lastTriggerAt = now
-        perform(action(for: gesture))
+        perform(action(for: gesture), gesture: gesture)
     }
 
     // MARK: - 动作执行
 
-    private func perform(_ action: Action) {
+    private func perform(_ action: Action, gesture: Gesture) {
         switch action {
         case .none:
             return
+        case .openCustomApp:
+            openCustomApp(for: gesture)
 
         // 常用快捷键
         case .copy:      logAndSend("复制 ⌘C", 8, .maskCommand)
@@ -338,6 +393,20 @@ final class GestureController {
         }
         NSWorkspace.shared.open(url)
         Log.write("[action] 打开 \(action.title)")
+    }
+
+    /// 打开手势绑定的自定义 App（绝对路径）
+    private func openCustomApp(for gesture: Gesture) {
+        guard let path = customAppPath(for: gesture) else {
+            Log.write("[action] 自定义 App 路径未设置（\(gesture.title)）")
+            return
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            Log.write("[action] 自定义 App 不存在：\(path)")
+            return
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+        Log.write("[action] 打开自定义 App：\(Self.displayName(ofAppAt: path))")
     }
 }
 
