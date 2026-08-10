@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var enabledItem: NSMenuItem!
     private var swapItem: NSMenuItem!
+    private var deleteItem: NSMenuItem!
     private var permissionItem: NSMenuItem!
     private var launchItem: NSMenuItem!
 
@@ -70,6 +71,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         swapItem.target = self
         menu.addItem(swapItem)
 
+        deleteItem = NSMenuItem(title: "", action: #selector(toggleDelete), keyEquivalent: "")
+        deleteItem.target = self
+        menu.addItem(deleteItem)
+
         menu.addItem(.separator())
 
         permissionItem = NSMenuItem(title: "", action: #selector(openPermissionSettings), keyEquivalent: "")
@@ -95,6 +100,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         enabledItem.state = controller.enabled ? .on : .off
         swapItem.title = controller.swapDirection ? "方向：下滑复制 / 上滑粘贴" : "方向：上滑复制 / 下滑粘贴"
         swapItem.state = controller.swapDirection ? .on : .off
+        deleteItem.title = controller.deleteEnabled ? "三指按住+第四指点按：删除到废纸篓（已开启）" : "三指按住+第四指点按：删除到废纸篓（已关闭）"
+        deleteItem.state = controller.deleteEnabled ? .on : .off
     }
 
     // MARK: - 手势监听与权限
@@ -120,6 +127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MultitouchMonitor.shared.onThreeFingerVerticalSwipe = { [weak self] up in
             self?.controller.handleThreeFinger(up: up)
         }
+        MultitouchMonitor.shared.onFourFingerTap = { [weak self] in
+            self?.controller.handleFourFingerTap()
+        }
         MultitouchMonitor.shared.start()
         mtStarted = true
         refreshPermissionItem()
@@ -142,6 +152,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleSwap() {
         controller.swapDirection.toggle()
+        refreshStatusItems()
+    }
+
+    @objc private func toggleDelete() {
+        controller.deleteEnabled.toggle()
         refreshStatusItems()
     }
 

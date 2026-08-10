@@ -10,6 +10,7 @@ final class GestureController {
     private enum Keys {
         static let enabled = "enabled"
         static let swapDirection = "swapDirection"
+        static let deleteEnabled = "deleteEnabled"
     }
 
     /// 是否启用（菜单可暂停）
@@ -22,6 +23,11 @@ final class GestureController {
         didSet { UserDefaults.standard.set(swapDirection, forKey: Keys.swapDirection) }
     }
 
+    /// 是否启用「三指按住 + 第四指点按 = 删除到废纸篓」（菜单可开关）
+    var deleteEnabled: Bool {
+        didSet { UserDefaults.standard.set(deleteEnabled, forKey: Keys.deleteEnabled) }
+    }
+
     /// 防抖冷却：两次触发之间的最小间隔（秒）
     private let cooldown: TimeInterval = 0.45
     private var lastTriggerAt: CFTimeInterval = 0
@@ -30,6 +36,7 @@ final class GestureController {
         let defaults = UserDefaults.standard
         enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         swapDirection = defaults.object(forKey: Keys.swapDirection) as? Bool ?? false
+        deleteEnabled = defaults.object(forKey: Keys.deleteEnabled) as? Bool ?? true
     }
 
     /// MultitouchSupport 通道回调：三指纵向滑动已确认。
@@ -45,11 +52,22 @@ final class GestureController {
         perform(action)
     }
 
+    /// MultitouchSupport 通道回调：三指按住 + 第四指点按已确认。
+    /// 触发「移到废纸篓」（⌘⌫），与 Finder 中删除选中文件一致。
+    func handleFourFingerTap() {
+        guard enabled, deleteEnabled else { return }
+        let now = CACurrentMediaTime()
+        guard now - lastTriggerAt > cooldown else { return }
+        lastTriggerAt = now
+        perform(.delete)
+    }
+
     // MARK: - 按键动作
 
     private enum Action {
         case copy
         case paste
+        case delete
     }
 
     private func perform(_ action: Action) {
@@ -60,6 +78,9 @@ final class GestureController {
         case .paste:
             Log.write("[action] 发送 ⌘V (keycode 9)")
             sendCommandKey(keycode: 9)
+        case .delete:
+            Log.write("[action] 发送 ⌘⌫ (keycode 51)")
+            sendCommandKey(keycode: 51)
         }
     }
 
