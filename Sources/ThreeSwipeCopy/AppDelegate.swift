@@ -2,9 +2,9 @@ import AppKit
 import ApplicationServices
 import ServiceManagement
 
-/// 菜单栏应用入口：状态栏图标 + 三指手势监听（MultitouchSupport）+ 开机自启动开关。
+/// 菜单栏应用入口：状态栏图标 + 三指手势监听（MultitouchSupport）+ 可自定义手势动作 + 开机自启动开关。
 @main
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var statusItem: NSStatusItem?
     private var permissionCheckTimer: Timer?
@@ -14,10 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var wasTrusted = false
 
     private var enabledItem: NSMenuItem!
-    private var swapItem: NSMenuItem!
-    private var deleteItem: NSMenuItem!
     private var permissionItem: NSMenuItem!
     private var launchItem: NSMenuItem!
+    private var gestureItems: [Gesture: NSMenuItem] = [:]
 
     static func main() {
         let app = NSApplication.shared
@@ -28,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         wasTrusted = AXIsProcessTrusted()
-        Log.write("[launch] 应用启动 axTrusted=\(wasTrusted) enabled=\(controller.enabled) swap=\(controller.swapDirection)")
+        Log.write("[launch] 应用启动 axTrusted=\(wasTrusted) enabled=\(controller.enabled)")
         NSApp.setActivationPolicy(.accessory)
         buildMenu()
         refreshPermissionItem()
@@ -36,7 +35,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startGestureMonitoring()
         requestAccessibilityIfNeeded()
 
-        // 定时刷新权限状态显示（手势监听本身已启动，授权只影响能否发送 ⌘C/⌘V）
+        // 定时刷新权限状态显示（手势监听本身已启动，授权只影响能否发送快捷键）
         permissionCheckTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.permissionCheckTick()
         }
@@ -57,6 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
+        menu.delegate = self
 
         let header = NSMenuItem(title: "三指复制粘贴", action: nil, keyEquivalent: "")
         header.isEnabled = false
@@ -67,13 +67,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         enabledItem.target = self
         menu.addItem(enabledItem)
 
-        swapItem = NSMenuItem(title: "", action: #selector(toggleSwap), keyEquivalent: "")
-        swapItem.target = self
-        menu.addItem(swapItem)
+        menu.addItem(.separator())
 
-        deleteItem = NSMenuItem(title: "", action: #selector(toggleDelete), keyEquivalent: "")
-        deleteItem.target = self
-        menu.addItem(deleteItem)
+        // 手势设置：每个手势一个子菜单，可自定义绑定动作
+        let settingsHeader = NSMenuItem(title: "手势设置", action: nil, keyEquivalent: "")
+        settingsHeader.isEnabled = false
+        menu.addItem(settingsHeader)
+
+        for gesture in Gesture.allCases {
+            let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+            gestureItems[gesture] = item
+        }
+
+        let resetItem = NSMenuItem(title: "恢复默认动作", action: #selector(resetActions), keyEquivalent: "")
+        resetItem.target = self
+        menu.addItem(resetItem)
 
         menu.addItem(.separator())
 
@@ -95,13 +105,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatusItems()
     }
 
+    /// 菜单打开前刷新（标题 + 手势子菜单，保证改动立即生效）
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshStatusItems()
+    }
+
     private func refreshStatusItems() {
         enabledItem.title = controller.enabled ? "已启用（点按暂停）" : "已暂停（点按启用）"
         enabledItem.state = controller.enabled ? .on : .off
-        swapItem.title = controller.swapDirection ? "方向：下滑复制 / 上滑粘贴" : "方向：上滑复制 / 下滑粘贴"
-        swapItem.state = controller.swapDirection ? .on : .off
-        deleteItem.title = controller.deleteEnabled ? "三指按住+第四指点按：删除到废纸篓（已开启）" : "三指按住+第四指点按：删除到废纸篓（已关闭）"
-        deleteItem.state = controller.deleteEnabled ? .on : .off
+
+        for gesture in Gesture.allCases {
+            guard let item = gestureItems[gesture] else { continue }
+            let current = controller.action(for: gesture)
+            item.title = "\(gesture.title)：\(current.title)"
+            item.submenu = buildActionSubmenu(for: gesture)
+        }
+    }
+
+    /// 构建某个手势的动作选择子菜单（BTT 风格分组）
+    private func buildActionSubmenu(for gesture: Gesture) -> NSMenu {
+        let menu = NSMenu()
+        let current = controller.action(for: gesture)
+
+        func addAction(_ action: Action) {
+            let item = NSMenuItem(title: action.title, action: #selector(selectAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = ActionItemPayload(gesture: gesture, action: action)
+            item.state = (action == current) ? .on : .off
+            menu.addItem(item)
+        }
+
+        func addSection(_ title: String, _ actions: [Action]) {
+            let header = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            menu.addItem(header)
+            for a in actions { addAction(a) }
+        }
+
+        addAction(.none)
+        menu.addItem(.separator())
+
+        addSection("常用快捷键", [.copy, .paste, .cut, .undo, .redo, .selectAll,
+                                   .save, .find, .deleteFile, .spotlight,
+                                   .closeWindow, .hideApp, .minimizeWindow,
+                                   .switchApp, .fullscreen])
+        addSection("打开 App", [.openFinder, .openSafari, .openChrome, .openTerminal,
+                                .openNotes, .openMail, .openMessages, .openMusic,
+                                .openCalculator, .openSystemSettings])
+        addSection("媒体与音量", [.mediaToggle, .mediaNext, .mediaPrev,
+                                  .volumeUp, .volumeDown, .volumeMute])
+        addSection("系统控制", [.missionControl, .launchpad, .showDesktop,
+                               .lockScreen, .sleepDisplay, .screenshot])
+
+        return menu
     }
 
     // MARK: - 手势监听与权限
@@ -121,14 +177,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
-    /// 启动 MultitouchSupport 触控板触点监听（读取触点不需要授权；发送 ⌘C/⌘V 需要授权）
+    /// 启动 MultitouchSupport 触控板触点监听（读取触点不需要授权；发送快捷键需要授权）
     private func startGestureMonitoring() {
         guard !mtStarted else { return }
-        MultitouchMonitor.shared.onThreeFingerVerticalSwipe = { [weak self] up in
-            self?.controller.handleThreeFinger(up: up)
+        MultitouchMonitor.shared.onSwipe = { [weak self] direction in
+            self?.controller.handle(Gesture(direction))
         }
         MultitouchMonitor.shared.onFourFingerTap = { [weak self] in
-            self?.controller.handleFourFingerTap()
+            self?.controller.handle(.fourFingerTap)
         }
         MultitouchMonitor.shared.start()
         mtStarted = true
@@ -150,13 +206,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatusItems()
     }
 
-    @objc private func toggleSwap() {
-        controller.swapDirection.toggle()
+    @objc private func selectAction(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? ActionItemPayload else { return }
+        controller.setAction(payload.action, for: payload.gesture)
         refreshStatusItems()
     }
 
-    @objc private func toggleDelete() {
-        controller.deleteEnabled.toggle()
+    @objc private func resetActions() {
+        controller.resetAll()
         refreshStatusItems()
     }
 
@@ -198,5 +255,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApp.terminate(nil)
+    }
+}
+
+/// 菜单项携带的数据：手势 + 动作
+private final class ActionItemPayload: NSObject {
+    let gesture: Gesture
+    let action: Action
+    init(gesture: Gesture, action: Action) {
+        self.gesture = gesture
+        self.action = action
     }
 }

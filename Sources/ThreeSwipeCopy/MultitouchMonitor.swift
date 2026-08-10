@@ -17,8 +17,8 @@ final class MultitouchMonitor {
 
     static let shared = MultitouchMonitor()
 
-    /// 三指纵向滑动已确认：true = 上滑，false = 下滑
-    var onThreeFingerVerticalSwipe: ((_ up: Bool) -> Void)?
+    /// 三指滑动已确认：方向（上 / 下 / 左 / 右）
+    var onSwipe: ((_ direction: SwipeDirection) -> Void)?
 
     /// 三指按住 + 第四指点按（轻点）已确认
     var onFourFingerTap: (() -> Void)?
@@ -186,6 +186,9 @@ final class MultitouchMonitor {
 
     // MARK: - 三指滑动
 
+    /// 识别三指上/下/左/右滑动。以位移大的方向为主轴判定；
+    /// 注意：三指左右滑默认被系统用于「在全屏 App 之间切换」，若用户想用手势绑定
+    /// 左右动作，需要在 系统设置 → 触控板 → 更多手势 里关闭该系统的三指手势。
     private func handleThreeFingerSwipe(touches: [Touch]) {
         // 严格三指才判定；手指数变化时重置会话
         guard touches.count == 3 else {
@@ -220,33 +223,37 @@ final class MultitouchMonitor {
         }
         guard totalDX.count == 3, totalDY.count == 3 else { return }
 
-        // 防误触 1：三根手指必须都在移动（两指滚动+一指悬停时，悬停指位移≈0）
-        guard totalDY.allSatisfy({ abs($0) >= minPerFingerMove }) else { return }
-
         let avgX = totalDX.reduce(0, +) / 3
         let avgY = totalDY.reduce(0, +) / 3
 
-        // 防误触 2：以纵向为主（三指左右滑是切换应用等系统手势，不做处理）
-        guard abs(avgY) > abs(avgX) else { return }
+        // 主轴判定：位移大的方向为主
+        let verticalDominant = abs(avgY) > abs(avgX)
 
-        // 方向一致性：三指同向才算一次滑动
-        let signY = Set(totalDY.map { $0 > 0 })
-        guard signY.count == 1 else { return }
-
-        guard abs(avgY) >= threshold else { return }
-
-        // 触控板归一化坐标：本机实测 y 增大 = 向屏幕上方滑；若方向反了可在菜单里交换
-        let up = avgY > 0
-        fire(up: up)
+        if verticalDominant {
+            // 防误触 1：三根手指纵向必须都在移动（两指滚动+一指悬停时，悬停指位移≈0）
+            guard totalDY.allSatisfy({ abs($0) >= minPerFingerMove }) else { return }
+            // 方向一致性：三指同向才算一次滑动
+            let signY = Set(totalDY.map { $0 > 0 })
+            guard signY.count == 1 else { return }
+            guard abs(avgY) >= threshold else { return }
+            fire(avgY > 0 ? .up : .down)
+        } else {
+            // 横向滑动同理：三指横向必须都在移动
+            guard totalDX.allSatisfy({ abs($0) >= minPerFingerMove }) else { return }
+            let signX = Set(totalDX.map { $0 > 0 })
+            guard signX.count == 1 else { return }
+            guard abs(avgX) >= threshold else { return }
+            fire(avgX > 0 ? .right : .left)
+        }
         session = nil
     }
 
-    private func fire(up: Bool) {
+    private func fire(_ direction: SwipeDirection) {
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastFireAt > cooldown else { return }
         lastFireAt = now
-        Log.write("[mt] 三指\(up ? "上滑" : "下滑") 已确认")
-        onThreeFingerVerticalSwipe?(up)
+        Log.write("[mt] 三指\(direction.logName) 已确认")
+        onSwipe?(direction)
     }
 
     // MARK: - 三指按住 + 第四指点按
