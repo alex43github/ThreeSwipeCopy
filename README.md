@@ -16,6 +16,9 @@
 
 </div>
 
+
+![ThreeSwipeCopy 菜单栏截图](docs/screenshot.png)
+
 ---
 
 ## 🚀 为什么用它
